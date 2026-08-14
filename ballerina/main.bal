@@ -30,12 +30,19 @@ function init() returns error? {
     // Send initial heartbeat to register with ICP server. Fields the ICP server confirmed
     // it understands come back on this same call — no extra round-trip needed to discover
     // them.
+    // A failed or rejected initial heartbeat must not stop the agent. The scheduled job below
+    // retries on its normal interval and recovers on its own once the server accepts this
+    // runtime - after a restart, for example, the previous incarnation's record has to age out
+    // first. Returning here instead left the runtime permanently disconnected while its process
+    // kept serving traffic.
+    string[] supportedFields = [];
     string[]|error supportedFieldsResult = sendInitialHeartbeat(icpClient);
     if supportedFieldsResult is error {
-        log:printError("Failed initial heartbeat registration with ICP server", supportedFieldsResult);
-        return;
+        log:printError("Initial heartbeat registration failed; the scheduled heartbeat will retry",
+                supportedFieldsResult);
+    } else {
+        supportedFields = supportedFieldsResult;
     }
-    string[] supportedFields = supportedFieldsResult;
 
     worker w1 returns error? {
         check startICPAgent(icpClient, config, supportedFields);
@@ -85,7 +92,9 @@ public class HeartbeatJob {
     private final IcpClient icpClient;
     private final decimal interval;
     private int attemptCount = 0;
-    private Heartbeat heartbeat;
+    // Nil until a heartbeat has been built. execute() rebuilds it on every full heartbeat, and
+    // fullHeartbeatRequired starts true, so the first run always produces one.
+    private Heartbeat? heartbeat = ();
     private boolean fullHeartbeatRequired = true;
     private string[] supportedHeartbeatFields;
 
@@ -93,7 +102,16 @@ public class HeartbeatJob {
         self.icpClient = icpClient;
         self.interval = interval;
         self.supportedHeartbeatFields = supportedHeartbeatFields;
-        self.heartbeat = check getHeartbeat(self.supportedHeartbeatFields);
+        // Failing to build the heartbeat here must not stop the job being scheduled - that would
+        // leave the runtime disconnected until its process restarts, which is the failure this
+        // job exists to recover from. execute() already tolerates the same failure and retries.
+        Heartbeat|error initialHeartbeat = getHeartbeat(self.supportedHeartbeatFields);
+        if initialHeartbeat is error {
+            log:printError("Failed to create the initial heartbeat; the scheduled heartbeat will retry",
+                    initialHeartbeat);
+        } else {
+            self.heartbeat = initialHeartbeat;
+        }
     }
 
     # Executes the heartbeat job.
@@ -108,10 +126,16 @@ public class HeartbeatJob {
             }
             self.heartbeat = newHeartbeat;
             log:printInfo("Sending full heartbeat to ICP server");
-            heartbeatResponse = self.icpClient->sendHeartbeat(self.heartbeat);
+            heartbeatResponse = self.icpClient->sendHeartbeat(newHeartbeat);
         } else {
+            Heartbeat? lastHeartbeat = self.heartbeat;
+            if lastHeartbeat is () {
+                // No full heartbeat has been built yet, so there is nothing to diff against.
+                self.fullHeartbeatRequired = true;
+                return;
+            }
             // Create delta heartbeat with hash
-            DeltaHeartbeat|error deltaHeartbeat = getDeltaHeartbeat(self.heartbeat);
+            DeltaHeartbeat|error deltaHeartbeat = getDeltaHeartbeat(lastHeartbeat);
             if deltaHeartbeat is error {
                 log:printError("Failed to create delta heartbeat", deltaHeartbeat);
                 return;
