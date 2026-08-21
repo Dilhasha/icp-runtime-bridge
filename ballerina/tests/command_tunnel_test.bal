@@ -270,29 +270,35 @@ function testCommandExecutingInAnotherRoundIsSkipped() {
 }
 
 @test:Config {}
-function testResultCacheEvictsOldestFirst() {
-    // The cache is bounded, so a redelivery long after the fact re-executes rather than
-    // letting the bridge grow without limit. Only the oldest entries lose their replay.
+function testRecentResultsSurviveACacheOverflow() {
+    // A redelivery minutes later must replay, not re-execute: the ICP keeps a mutation
+    // deliverable for half an hour so a lost result can be recovered, and that recovery is
+    // only safe while the result is still here. Load must therefore not be able to evict a
+    // young entry - a full batch of reads arriving before a task completion's result is
+    // redelivered would otherwise complete that task twice.
     resetExecutorState();
-    string oldest = "wfc-evict-oldest";
+    string oldest = "wfc-overflow-oldest";
     TunneledCommandResult? first = executeTunneledCommand(commandPayload(oldest), okExecutor, true);
     test:assertTrue(first !is (), "The first command must produce a result");
 
     foreach int i in 0 ..< PROCESSED_COMMAND_CACHE_CAPACITY {
         TunneledCommandResult? filler = executeTunneledCommand(
-                commandPayload(string `wfc-evict-filler-${i}`), okExecutor, true);
+                commandPayload(string `wfc-overflow-filler-${i}`), okExecutor, true);
         test:assertTrue(filler !is (), "Each filler command must produce a result");
     }
 
     int callsBefore = executorCallCount();
-    TunneledCommandResult? afterEviction = executeTunneledCommand(
+    TunneledCommandResult? redelivered = executeTunneledCommand(
             commandPayload(oldest), okExecutor, true);
-    test:assertTrue(afterEviction !is (), "The evicted command must be executed again");
-    test:assertEquals(executorCallCount(), callsBefore + 1,
-            "An evicted commandId is no longer replayable, so it executes again");
+    test:assertTrue(redelivered !is (), "A redelivered command must still answer");
+    test:assertEquals(executorCallCount(), callsBefore,
+            "An entry younger than the minimum age must be replayed, not re-executed, " +
+            "however many commands arrived after it");
 
-    // The most recent command is still replayable.
-    string newest = string `wfc-evict-filler-${PROCESSED_COMMAND_CACHE_CAPACITY - 1}`;
+    // Entries older than PROCESSED_COMMAND_MIN_AGE_SECONDS are evicted normally, which keeps
+    // the cache bounded. That path is not exercised here because it needs clock control;
+    // what matters for correctness is that a young result cannot be lost.
+    string newest = string `wfc-overflow-filler-${PROCESSED_COMMAND_CACHE_CAPACITY - 1}`;
     int callsBeforeReplay = executorCallCount();
     TunneledCommandResult? replayed = executeTunneledCommand(commandPayload(newest), okExecutor, true);
     test:assertTrue(replayed !is (), "A cached command must still answer");

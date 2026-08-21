@@ -62,12 +62,28 @@ isolated function validateCommandDeadline(string? deadline, string commandId) re
 // heartbeat rounds delivering the same command cannot both execute it.
 // Insertion-ordered FIFO eviction; one record so a single lock covers all structures
 // (a lock statement may access only one isolated module-level variable).
-const int PROCESSED_COMMAND_CACHE_CAPACITY = 64;
+//
+// The capacity has to outlast the window in which the ICP may redeliver a command whose
+// result was lost. A control plane that redelivers minutes later relies on finding the
+// entry here: if it has been evicted, the "safe" redelivery re-executes the operation
+// instead of replaying it, completing a human task twice. Ten heartbeat rounds of a full
+// batch is the working figure - a batch is capped at ten reads plus ten mutations - and
+// entries are also kept for a minimum age so a burst of reads cannot evict the mutation
+// results that actually matter.
+const int PROCESSED_COMMAND_CACHE_CAPACITY = 512;
+
+// An entry younger than this is never evicted to make room, even when the cache is full;
+// the cache grows past its capacity instead. Sustained load evicting a mutation's result
+// inside the redelivery window is the failure this prevents, and a few hundred extra
+// entries cost far less than an operation running twice.
+const decimal PROCESSED_COMMAND_MIN_AGE_SECONDS = 300;
 
 type ProcessedCommandCache record {|
     map<TunneledCommandResult> results = {};
     map<boolean> inFlight = {};
     string[] insertionOrder = [];
+    // commandId -> when its result was stored, for the minimum-age rule.
+    map<time:Utc> storedAt = {};
 |};
 
 isolated ProcessedCommandCache processedCommands = {};
@@ -96,12 +112,23 @@ isolated function storeCommandResult(TunneledCommandResult result) {
         if processedCommands.results.hasKey(result.commandId) {
             return;
         }
-        if processedCommands.insertionOrder.length() >= PROCESSED_COMMAND_CACHE_CAPACITY {
-            string evicted = processedCommands.insertionOrder.shift();
-            _ = processedCommands.results.removeIfHasKey(evicted);
+        time:Utc now = time:utcNow();
+        // Evict only entries old enough to be outside the redelivery window. Stopping at the
+        // first young entry keeps this O(evicted) rather than O(cache).
+        while processedCommands.insertionOrder.length() >= PROCESSED_COMMAND_CACHE_CAPACITY {
+            string oldest = processedCommands.insertionOrder[0];
+            time:Utc? storedAt = processedCommands.storedAt[oldest];
+            if storedAt is time:Utc
+                    && time:utcDiffSeconds(now, storedAt) < PROCESSED_COMMAND_MIN_AGE_SECONDS {
+                break;
+            }
+            _ = processedCommands.insertionOrder.shift();
+            _ = processedCommands.results.removeIfHasKey(oldest);
+            _ = processedCommands.storedAt.removeIfHasKey(oldest);
         }
         processedCommands.insertionOrder.push(result.commandId);
         processedCommands.results[result.commandId] = result.clone();
+        processedCommands.storedAt[result.commandId] = now;
     }
 }
 

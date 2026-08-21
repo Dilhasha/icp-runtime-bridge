@@ -44,3 +44,9 @@ public function loadConfig() returns IcpConfig|error {
     };
     return config;
 }
+
+// How many tunneled commands this runtime executes at once. A heartbeat batch is capped by
+// the ICP at ten reads plus ten mutations, so a handful in flight covers a full batch in two
+// or three rounds while keeping a bound on concurrent Temporal calls and worker threads: the
+// answers arrive slightly later rather than the process being saturated.
+configurable int tunneledCommandConcurrency = 4;

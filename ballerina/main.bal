@@ -247,6 +247,9 @@ public class HeartbeatJob {
 
         boolean artifactsChanged = false;
         boolean tunneledCommandProcessed = false;
+        // Tunneled commands are collected here and executed concurrently once the artifact
+        // commands - which mutate this runtime's own state and must stay ordered - are done.
+        [ControlCommand, TunneledCommandExecutor?, boolean][] tunneledCommands = [];
         foreach ControlCommand command in commands {
             log:printInfo(string `Handling control command: ${command.toJsonString()}`);
             command.status = PENDING;
@@ -309,7 +312,12 @@ public class HeartbeatJob {
                         result = error(string `No handler is wired for control action ${command.action}`);
                     } else {
                         tunneledCommandProcessed = true;
-                        result = self.handleTunneledCommand(command, binding[0], binding[1]);
+                        // Executed off this strand: a batch carries the queued work of several
+                        // people, and running it in sequence here made every one of them wait
+                        // for the slowest (a large history is seconds of work) while the next
+                        // heartbeat - and so every other command - waited for the whole batch.
+                        // Each command reports its own outcome, so nothing is joined.
+                        tunneledCommands.push([command, binding[0], binding[1]]);
                     }
                 }
             }
@@ -323,6 +331,13 @@ public class HeartbeatJob {
             }
         }
 
+        // Fan the tunneled commands out with a bounded number in flight, so a large batch
+        // degrades into slightly later answers rather than into a saturated worker pool or a
+        // rate-limited Temporal client.
+        if tunneledCommands.length() > 0 {
+            self.executeTunneledCommands(tunneledCommands);
+        }
+
         if artifactsChanged {
             Heartbeat|error newHeartbeat = getHeartbeat(self.supportedHeartbeatFields);
             if newHeartbeat is error {
@@ -332,6 +347,45 @@ public class HeartbeatJob {
             self.heartbeat = newHeartbeat;
         }
         return tunneledCommandProcessed;
+    }
+
+    # Executes a batch of tunneled commands with a bounded number in flight.
+    #
+    # A batch carries the queued work of several people. Running it in sequence made each of
+    # them wait for the slowest - a large history is seconds of work - and held up the next
+    # heartbeat, and so every command after it, for the length of the whole batch.
+    #
+    # The batch is still waited for before returning, deliberately: the bridge asks the ICP
+    # for more work only once it has finished, and that pull is the back-pressure that keeps
+    # a backlog from arriving faster than it can be executed.
+    #
+    # + commands - The tunneled commands, each with its executor and acceptance flag
+    function executeTunneledCommands([ControlCommand, TunneledCommandExecutor?, boolean][] commands) {
+        int index = 0;
+        while index < commands.length() {
+            int chunkEnd = index + tunneledCommandConcurrency;
+            if chunkEnd > commands.length() {
+                chunkEnd = commands.length();
+            }
+            future<error?>[] running = [];
+            ControlCommand[] inChunk = [];
+            foreach int i in index ..< chunkEnd {
+                [ControlCommand, TunneledCommandExecutor?, boolean] item = commands[i];
+                inChunk.push(item[0]);
+                future<error?> pending = start self.handleTunneledCommand(item[0], item[1], item[2]);
+                running.push(pending);
+            }
+            foreach int i in 0 ..< running.length() {
+                error? outcome = wait running[i];
+                if outcome is error {
+                    log:printError(string `Command failed: ${inChunk[i].commandId}`, outcome);
+                    inChunk[i].status = FAILED;
+                } else {
+                    inChunk[i].status = COMPLETED;
+                }
+            }
+            index = chunkEnd;
+        }
     }
 
     # Executes one tunneled command and posts its result to the ICP. A command past
