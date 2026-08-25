@@ -37,8 +37,12 @@ def compilerApiJars = fileTree("${ballerinaHome}/bre/lib").matching {
     include 'ballerina-rt-*.jar'
 }
 
-def openapiMapperJar = fileTree("${ballerinaHome}/repo/bala/ballerina/http/${httpVersion}/java21/compiler-plugin").matching {
-    include '**/ballerina-to-openapi-*.jar'
+// The distribution's bala repo ships exactly one http version, and which one depends on the
+// distribution (2201.13.2 → 2.15.4, 2201.13.4 → 2.16.3). Pinning that version in a property
+// broke whichever environment ran the other distribution — local or CI — so the lookup takes
+// whatever version the distribution in use actually shipped.
+def openapiMapperJar = fileTree("${ballerinaHome}/repo/bala/ballerina/http").matching {
+    include '*/java21/compiler-plugin/**/ballerina-to-openapi-*.jar'
 }
 
 dependencies {
