@@ -134,7 +134,9 @@ isolated function getHeartbeat(string[] supportedHeartbeatFields = []) returns H
     }
 
     // The workflow worker's task queue — runtime state like capabilities, so it travels on
-    // every heartbeat rather than inside the (full-heartbeat-gated) metadata document.
+    // every FULL heartbeat rather than inside the metadata document. A queue that registers
+    // between full heartbeats is not lost: the heartbeat loop promotes the next round to a
+    // full one when the live value differs from the last published (see heartbeatRound).
     string? workflowTaskQueue = currentWorkflowTaskQueue();
     if workflowTaskQueue is string {
         heartbeat.workflowTaskQueue = workflowTaskQueue;

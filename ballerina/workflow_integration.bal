@@ -34,8 +34,8 @@ public type WorkflowMetadataProvider isolated function () returns map<json>|erro
 
 # Supplies the Temporal task queue the integration's workflow worker serves, or nil before
 # the worker has registered. Typically an adapter over
-# `workflow.management:getWorkflowTaskQueue`. Read per heartbeat, so a queue known only
-# after startup still gets reported on the next one.
+# `workflow.management:getWorkflowTaskQueue`. Read each heartbeat round: a queue known only
+# after startup promotes the next round to a full heartbeat, which publishes it.
 public type WorkflowTaskQueueProvider isolated function () returns string?;
 
 # The capability advertised to the ICP while this runtime accepts tunneled workflow

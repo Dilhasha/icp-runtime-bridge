@@ -179,6 +179,17 @@ public class HeartbeatJob {
     #            when no follow-up is needed this tick
     function heartbeatRound() returns decimal? {
         HeartbeatResponse|error heartbeatResponse;
+        // The workflow worker registers its task queue on its own schedule, often after the
+        // first full heartbeat has gone out — and delta heartbeats carry no fields. Left to
+        // itself, the queue would wait for an unrelated full-heartbeat trigger while the ICP
+        // scoped that runtime's reads namespace-wide. A change in the live value against the
+        // last published one promotes this round to a full heartbeat.
+        if !self.fullHeartbeatRequired {
+            Heartbeat? lastPublished = self.heartbeat;
+            if lastPublished is Heartbeat && currentWorkflowTaskQueue() != lastPublished?.workflowTaskQueue {
+                self.fullHeartbeatRequired = true;
+            }
+        }
         if (self.fullHeartbeatRequired) {
             Heartbeat|error newHeartbeat = getHeartbeat(self.supportedHeartbeatFields);
             if newHeartbeat is error {
@@ -361,9 +372,12 @@ public class HeartbeatJob {
     #
     # + commands - The tunneled commands, each with its executor and acceptance flag
     function executeTunneledCommands([ControlCommand, TunneledCommandExecutor?, boolean][] commands) {
+        // A misconfigured concurrency of 0 or less would keep chunkEnd at index and spin this
+        // loop forever, wedging every later heartbeat behind the in-progress guard.
+        int concurrency = int:max(1, tunneledCommandConcurrency);
         int index = 0;
         while index < commands.length() {
-            int chunkEnd = index + tunneledCommandConcurrency;
+            int chunkEnd = index + concurrency;
             if chunkEnd > commands.length() {
                 chunkEnd = commands.length();
             }

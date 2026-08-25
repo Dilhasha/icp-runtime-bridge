@@ -118,11 +118,14 @@ flowchart TD
     J --> K
 ```
 
-Strictly, the guarantee is at-most-once **within the retention window**: the cache is a FIFO of
-the last `PROCESSED_COMMAND_CACHE_CAPACITY` (64) results, so a redelivery arriving after its id
-has been evicted executes again. The bound is deliberate — replay protection must not grow without
-limit — and it is not a correctness problem at this protocol's timescales: a redelivery 64
-commands later is long past the ICP's 25s waiter, so nobody is listening for it anyway. A future
+Strictly, the guarantee is at-most-once **within the retention window**: the cache holds a
+nominal `PROCESSED_COMMAND_CACHE_CAPACITY` (512) results evicted oldest-first, but an entry
+younger than `PROCESSED_COMMAND_MIN_AGE_SECONDS` (300s) is never evicted to make room — the
+cache grows past its nominal capacity instead, so a burst of reads cannot push a mutation's
+result out inside the redelivery window. A redelivery arriving after its id has aged out and
+been evicted executes again. The bound is deliberate — replay protection must not grow without
+limit — and it is not a correctness problem at this protocol's timescales: a redelivery that
+late is long past the ICP's 25s waiter, so nobody is listening for it anyway. A future
 command kind whose mutations cannot tolerate that window must bring its own idempotency (an
 operation-level key), not a bigger cache.
 
@@ -205,5 +208,6 @@ the ICP without workflows must not pull the workflow module in behind it.
 - an unaccepted kind and a missing executor report `FAILED`/403 without reaching the executor;
 - a redelivered `commandId` replays the stored result and executes exactly once;
 - a command in flight in another round posts nothing;
-- an evicted `commandId` executes again, and a cached one still replays;
+- entries younger than the minimum age survive capacity overflow and still replay without
+  re-execution; an aged-out, evicted `commandId` executes again;
 - an expired deadline and a malformed one both refuse execution; an absent or future one allows it.
