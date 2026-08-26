@@ -149,8 +149,11 @@ task forms without calling into the integration. Setting
 `enableWorkflowManagement = true` additionally advertises the `workflowCommands`
 capability, allowing the ICP to tunnel workflow management commands (list/start
 workflows, complete human tasks, ...) to be executed in-process — no inbound
-network access to the integration or its Temporal server is required. Requires
-`ballerina/workflow` 0.9.0 or later.
+network access to the integration or its Temporal server is required. The bridge
+also publishes the workflow worker's **Temporal task queue** in full heartbeats
+(promoting the next heartbeat to a full one if the worker registers late), which
+the ICP uses to scope listings when integrations share a Temporal namespace.
+Requires `ballerina/workflow` 0.9.0 or later.
 
 ## Usage
 

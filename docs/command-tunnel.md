@@ -26,8 +26,8 @@ sequenceDiagram
     participant EX as Executor<br/>via generated glue
 
     UI->>ICP: GET /icp/workflow/{component}/{env}/instances
-    ICP->>ICP: pick a runtime advertising `workflowCommands`<br/>queue command `wfc-…`, restart heartbeat boost
-    Note over ICP,UI: the UI request blocks: 100 ms poll, up to 25 s
+    ICP->>ICP: pick a runtime advertising `workflowCommands`<br/>queue command `wfr-…` (read) / `wfo-…` (mutation)<br/>restart heartbeat boost
+    Note over ICP,UI: nothing blocks — a read answers from the ICP's cache<br/>(202 FETCHING when empty), a mutation answers 202 {operationId}
 
     BR->>ICP: POST /icp/heartbeat
     ICP-->>BR: 200 { commands: [ WORKFLOW_MGMT ] }
@@ -38,7 +38,7 @@ sequenceDiagram
     EX-->>BR: { httpStatus, body }
     BR->>BR: storeCommandResult(...)
     BR->>ICP: POST /icp/commandResult<br/>{ commandId, status, httpStatus, body }
-    ICP-->>UI: the runtime's status and body, unchanged
+    ICP-->>UI: served on the console's next poll of the cache / operation
 
     BR->>ICP: POST /icp/heartbeat (immediate follow-up)
     Note over BR,ICP: drains a queue of commands without<br/>waiting for the next scheduled beat
@@ -124,8 +124,8 @@ younger than `PROCESSED_COMMAND_MIN_AGE_SECONDS` (300s) is never evicted to make
 cache grows past its nominal capacity instead, so a burst of reads cannot push a mutation's
 result out inside the redelivery window. A redelivery arriving after its id has aged out and
 been evicted executes again. The bound is deliberate — replay protection must not grow without
-limit — and it is not a correctness problem at this protocol's timescales: a redelivery that
-late is long past the ICP's 25s waiter, so nobody is listening for it anyway. A future
+limit — and it lines up with the ICP's own retention: a confirmed operation is kept there for
+300s for the console to poll, the same window this cache guarantees a replay. A future
 command kind whose mutations cannot tolerate that window must bring its own idempotency (an
 operation-level key), not a bigger cache.
 
@@ -140,11 +140,11 @@ Latency is bounded by heartbeat cadence, not by a network call:
 
 | | |
 |---|---|
-| ICP waiter | 25s (inside the frontend's 30s), polling every 100ms; on expiry it withdraws the queued command and answers **504** |
-| First command after idle | Up to one full `heartbeatInterval` (default **10s**) — a faster cadence can only take effect on the *next* beat |
+| ICP deadlines | Nothing is held open on the ICP: a read command carries a 60s deadline (past it the view reports the failure and retries on the next visit); a mutation carries a **30-minute** deadline, so a user's action survives an integration restart instead of failing fast |
+| First command after idle | Up to one full `heartbeatInterval` (default **10s**) — a faster cadence can only take effect on the *next* beat; the console shows FETCHING meanwhile |
 | While someone is working | ~1s: the ICP asks for a 1s cadence, decaying 2s → 5s → 10s and off after 30s idle |
 | A burst of commands | Drains immediately — after executing one, the bridge heartbeats again at once instead of waiting for the next tick |
-| `heartbeatInterval` ≥ ~25s | The first command can outlive the waiter → 504; the retry lands in ~1s because the runtime is boosted. Keep the interval well below 25s |
+| Within one batch | Commands execute concurrently in chunks of `tunneledCommandConcurrency` (default 4, clamped to ≥1), mutations delivered before reads by the ICP |
 
 The `deadline` in the payload is the bridge's own guard: a command whose deadline has passed is
 dropped unexecuted (reported FAILED locally), because the caller has already given up and a late
