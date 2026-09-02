@@ -28,9 +28,11 @@ configurable string integration = "default_integration";
 configurable string project = "default_project";
 configurable string secret = ?;
 
+# Allow the ICP to tunnel workflow management commands to this runtime over the
+# heartbeat channel. The commands are executed in-process by the workflow runtime —
+# the integration exposes no management port and needs no API key.
 configurable boolean enableWorkflowManagement = false;
 configurable string runtimeHostUrl = "http://localhost";
-configurable int workflowManagementApiPort = 8234;
 
 public function loadConfig() returns IcpConfig|error {
     IcpConfig config = {
@@ -42,3 +44,9 @@ public function loadConfig() returns IcpConfig|error {
     };
     return config;
 }
+
+// How many tunneled commands this runtime executes at once. A heartbeat batch is capped by
+// the ICP at ten reads plus ten mutations, so a handful in flight covers a full batch in two
+// or three rounds while keeping a bound on concurrent Temporal calls and worker threads: the
+// answers arrive slightly later rather than the process being saturated.
+configurable int tunneledCommandConcurrency = 4;

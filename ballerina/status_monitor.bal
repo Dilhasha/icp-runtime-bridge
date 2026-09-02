@@ -74,8 +74,6 @@ isolated function getHeartbeat(string[] supportedHeartbeatFields = []) returns H
             main: check getMainArtifact()
         },
         logLevels: getLogLevels(),
-        workflowCallbackUrl: (enableWorkflowManagement && isHeartbeatFieldSupported(supportedHeartbeatFields, "workflowCallbackUrl"))
-            ? getWorkflowCallbackUrl() : (),
         tryItHost: isHeartbeatFieldSupported(supportedHeartbeatFields, "tryItHost") ? getTryItHost() : ()
     };
 
@@ -102,7 +100,6 @@ isolated function getHeartbeat(string[] supportedHeartbeatFields = []) returns H
         runtimeHash: runtimeHash,
         timestamp: time:utcNow(),
         logLevels: heartbeatForHash.logLevels,
-        workflowCallbackUrl: heartbeatForHash?.workflowCallbackUrl,
         tryItHost: heartbeatForHash?.tryItHost
     };
 
@@ -117,6 +114,32 @@ isolated function getHeartbeat(string[] supportedHeartbeatFields = []) returns H
         if packedOpenApiDefinitions.length() > 0 {
             heartbeat.openApiDefinitions = packedOpenApiDefinitions;
         }
+    }
+
+    // Add the workflow metadata document only if the server supports it and a workflow
+    // integration registered one (see workflow_integration.bal). Startup-constant like
+    // openApiDefinitions, so it is not part of the hash.
+    if isHeartbeatFieldSupported(supportedHeartbeatFields, "workflowMetadata") {
+        map<json>? workflowMetadata = currentWorkflowMetadata();
+        if workflowMetadata is map<json> {
+            heartbeat.workflowMetadata = workflowMetadata;
+        }
+    }
+
+    // Advertise runtime capabilities (e.g. accepting tunneled workflow management
+    // commands) so the server can gate capability-specific behavior per runtime.
+    string[]? capabilities = currentCapabilities();
+    if capabilities is string[] {
+        heartbeat.capabilities = capabilities;
+    }
+
+    // The workflow worker's task queue — runtime state like capabilities, so it travels on
+    // every FULL heartbeat rather than inside the metadata document. A queue that registers
+    // between full heartbeats is not lost: the heartbeat loop promotes the next round to a
+    // full one when the live value differs from the last published (see heartbeatRound).
+    string? workflowTaskQueue = currentWorkflowTaskQueue();
+    if workflowTaskQueue is string {
+        heartbeat.workflowTaskQueue = workflowTaskQueue;
     }
 
     return heartbeat;
@@ -204,43 +227,38 @@ isolated function getMainArtifact() returns MainDetail?|error =
     'class: "io.ballerina.lib.wso2.icp.Artifacts"
 } external;
 
-// Strips trailing slashes and any path segment from the configured runtimeHostUrl, returning
-// both the cleaned scheme+host[:port] and the bare authority (host[:port], no scheme) — shared
-// by getWorkflowCallbackUrl (needs the scheme, to build a callable base URL) and getTryItHost
-// (needs just the host, since the Try-It proxy already knows the target port separately).
-isolated function getConfiguredHostUrl() returns [string, string] {
-    string hostUrl = runtimeHostUrl.trim();
-    // Strip trailing slashes to avoid a malformed "http://host/:port".
+// The authority (host[:port], no scheme) of a configured host URL, with trailing slashes and
+// any path segment removed. Only the authority is wanted: its one caller, getTryItHost, needs
+// the host alone — the Try-It proxy knows the target port separately. Takes the URL as an
+// argument rather than reading the configurable, so the parsing can be tested on its own.
+isolated function authorityOf(string configuredUrl) returns string {
+    string hostUrl = configuredUrl.trim();
+    // Strip trailing slashes so a "host/" does not leave an empty path segment behind.
     while hostUrl.endsWith("/") {
         hostUrl = hostUrl.substring(0, hostUrl.length() - 1);
     }
-    // Isolate the authority (host[:port]); anything before "://" is the scheme.
+    // Anything before "://" is the scheme; what follows, up to the first "/", is the authority.
     int? schemeIndex = hostUrl.indexOf("://");
-    int authorityStart = schemeIndex is int ? schemeIndex + 3 : 0;
-    string authority = hostUrl.substring(authorityStart);
+    string authority = hostUrl.substring(schemeIndex is int ? schemeIndex + 3 : 0);
     int? pathIndex = authority.indexOf("/");
-    if pathIndex is int {
-        authority = authority.substring(0, pathIndex);
-        hostUrl = hostUrl.substring(0, authorityStart) + authority;
-    }
-    return [hostUrl, authority];
-}
-
-isolated function getWorkflowCallbackUrl() returns string {
-    var [hostUrl, authority] = getConfiguredHostUrl();
-    // If runtimeHostUrl already includes a port, use it as-is rather than
-    // appending the management port and producing "host:8080:9090".
-    if authority.includes(":") {
-        return hostUrl;
-    }
-    return string `${hostUrl}:${workflowManagementApiPort}`;
+    return pathIndex is int ? authority.substring(0, pathIndex) : authority;
 }
 
 // Bare, reachable host/IP for this runtime (no scheme, no port) reported in every heartbeat so
 // the ICP server can route Try-It proxy requests to it — the per-listener host captured
 // separately (Listeners.java) is often a bind-all address like 0.0.0.0, not a usable target.
 isolated function getTryItHost() returns string {
-    var [_, authority] = getConfiguredHostUrl();
+    return hostOf(authorityOf(runtimeHostUrl));
+}
+
+// The host of an authority, without the port. A bracketed IPv6 literal keeps its brackets —
+// they are what make the address usable in a URL — and the colons inside it are not port
+// separators, so the port is the colon after the closing bracket.
+isolated function hostOf(string authority) returns string {
+    if authority.startsWith("[") {
+        int? closingBracket = authority.indexOf("]");
+        return closingBracket is int ? authority.substring(0, closingBracket + 1) : authority;
+    }
     int? portIndex = authority.indexOf(":");
     return portIndex is int ? authority.substring(0, portIndex) : authority;
 }

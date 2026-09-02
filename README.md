@@ -25,6 +25,14 @@ The bridge operates as an agent within Ballerina runtime environments and consis
 - **Artifact Manager**: Monitors and reports deployed artifacts (services, APIs, listeners)
 - **Configuration Manager**: Manages runtime configuration and credentials
 - **Security Module**: Handles JWT generation and secure authentication
+- **Command Tunnel**: Executes control-plane commands in-process, delivered in heartbeat responses
+  and answered on an outbound call — so the ICP can manage a runtime it cannot connect to
+
+## Documentation
+
+- [The command tunnel](docs/command-tunnel.md) — how a control-plane request reaches a runtime that
+  nothing can connect to: the round trip, the at-most-once guarantees, timing, capability gating,
+  and how to add a new tunneled command kind.
 
 ## Building the Project
 
@@ -126,6 +134,26 @@ project = "my-project"
 | `environment`          | string          | "Dev"                    | No       | Environment name (Dev, Prod, etc.) |
 | `integration`          | string          | "default_integration"    | No       | Integration name                   |
 | `project`              | string          | "default_project"        | No       | Project name                       |
+| `enableWorkflowManagement` | boolean     | false                    | No       | Allow the ICP to tunnel workflow management commands to this runtime |
+| `runtimeHostUrl`       | string          | "http://localhost"       | No       | Reachable host URL of this runtime, used for the Try-It host |
+
+### Workflow integration
+
+When the integration uses `ballerina/workflow`, this package's compiler plugin
+automatically generates glue that wires the workflow runtime into the bridge — no
+extra imports or code. The bridge then publishes the integration's **workflow
+metadata** (workflow definitions, human tasks, activities, and durable agents,
+with their JSON schemas) in full heartbeats once the ICP server advertises the
+`workflowMetadata` heartbeat field, so the ICP can render workflow launchers and
+task forms without calling into the integration. Setting
+`enableWorkflowManagement = true` additionally advertises the `workflowCommands`
+capability, allowing the ICP to tunnel workflow management commands (list/start
+workflows, complete human tasks, ...) to be executed in-process — no inbound
+network access to the integration or its Temporal server is required. The bridge
+also publishes the workflow worker's **Temporal task queue** in full heartbeats
+(promoting the next heartbeat to a full one if the worker registers late), which
+the ICP uses to scope listings when integrations share a Temporal namespace.
+Requires `ballerina/workflow` 0.9.0 or later.
 
 ## Usage
 

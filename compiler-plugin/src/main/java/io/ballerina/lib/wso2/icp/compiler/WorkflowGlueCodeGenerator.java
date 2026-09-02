@@ -1,0 +1,180 @@
+/*
+ * Copyright (c) 2026, WSO2 LLC. (http://www.wso2.com) All Rights Reserved.
+ *
+ * WSO2 LLC. licenses this file to you under the Apache License,
+ * Version 2.0 (the "License"); you may not use this file except
+ * in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied. See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+package io.ballerina.lib.wso2.icp.compiler;
+
+import io.ballerina.projects.Package;
+import io.ballerina.projects.ResolvedPackageDependency;
+import io.ballerina.projects.SemanticVersion;
+import io.ballerina.projects.plugins.CodeGenerator;
+import io.ballerina.projects.plugins.CodeGeneratorContext;
+import io.ballerina.projects.plugins.GeneratorTask;
+import io.ballerina.projects.plugins.SourceGeneratorContext;
+import io.ballerina.tools.text.TextDocument;
+import io.ballerina.tools.text.TextDocuments;
+
+/**
+ * Generates the glue that wires an integration's workflow runtime into this bridge.
+ *
+ * <p>When the user's package depends on {@code ballerina/workflow} 0.9.0 or later, a source file
+ * is added to the default module that registers the workflow management metadata provider and
+ * command executor with the bridge ({@code registerWorkflowIntegration}). With that, importing
+ * {@code wso2/icp.runtime.bridge} is all an integration needs for the ICP to receive workflow
+ * metadata in heartbeats and (when {@code enableWorkflowManagement = true}) to tunnel workflow
+ * management commands — no extra imports, management REST API, or configuration in the user's
+ * code.
+ *
+ * <p>The generated file imports {@code ballerina/workflow.management} — the stable Ballerina-only
+ * management API, a module of the same {@code ballerina/workflow} package the user already
+ * depends on. It opens no port and starts no service; the bridge package itself keeps zero
+ * compile-time dependency on {@code ballerina/workflow}. {@code getWorkflowMetadata} and
+ * {@code executeCommand} first shipped in workflow 0.9.0, so nothing is generated for
+ * older workflow versions — the integration builds as before, just without ICP workflow support.
+ */
+public class WorkflowGlueCodeGenerator extends CodeGenerator {
+
+    @Override
+    public void init(CodeGeneratorContext generatorContext) {
+        generatorContext.addSourceGeneratorTask(new WorkflowGlueGeneratorTask());
+    }
+
+    private static final class WorkflowGlueGeneratorTask implements GeneratorTask<SourceGeneratorContext> {
+
+        private static final String WORKFLOW_ORG = "ballerina";
+        private static final String WORKFLOW_PACKAGE = "workflow";
+        // getWorkflowMetadata/executeCommand first shipped in workflow 0.9.0.
+        private static final SemanticVersion MIN_WORKFLOW_VERSION = SemanticVersion.from("0.9.0");
+        private static final String GLUE_FILE_PREFIX = "icp_workflow_glue";
+
+        @Override
+        public void generate(SourceGeneratorContext context) {
+            // Never add sources to a package that already fails to compile.
+            if (context.compilation().diagnosticResult().hasErrors()) {
+                return;
+            }
+            if (!hasSupportedWorkflowDependency(context)) {
+                return;
+            }
+            TextDocument glue = TextDocuments.from(glueSource());
+            context.addSourceFile(glue, GLUE_FILE_PREFIX);
+        }
+
+        /**
+         * Reports whether the package's resolved dependencies include
+         * {@code ballerina/workflow} at {@link #MIN_WORKFLOW_VERSION} or later.
+         */
+        private boolean hasSupportedWorkflowDependency(SourceGeneratorContext context) {
+            for (ResolvedPackageDependency dependency : context.compilation().getResolution().allDependencies()) {
+                Package dependencyPackage = dependency.packageInstance();
+                if (dependencyPackage == null) {
+                    continue;
+                }
+                var descriptor = dependencyPackage.descriptor();
+                if (!WORKFLOW_ORG.equals(descriptor.org().value())
+                        || !WORKFLOW_PACKAGE.equals(descriptor.name().value())) {
+                    continue;
+                }
+                return descriptor.version().value().greaterThanOrEqualTo(MIN_WORKFLOW_VERSION);
+            }
+            return false;
+        }
+
+        /**
+         * The generated glue. Identifiers carry an {@code _icp} prefix to stay clear of user
+         * symbols; imports are file-scoped, so they never clash with the user's own imports of
+         * the same modules under different prefixes.
+         */
+        private String glueSource() {
+            return """
+                    // AUTO-GENERATED by the wso2/icp.runtime.bridge compiler plugin. Do not edit.
+                    // Wires this integration's workflow runtime into the ICP bridge: workflow
+                    // metadata is published in heartbeats, and (when enableWorkflowManagement is
+                    // true) management commands tunneled by the ICP are executed in-process.
+                    import ballerina/workflow.management as _icpWorkflowMgmt;
+                    import wso2/icp.runtime.bridge as _icpBridge;
+
+                    final boolean _icpWorkflowIntegrationRegistered = _icpBridge:registerWorkflowIntegration(
+                            _icpWorkflowMetadataProvider, _icpWorkflowCommandExecutor,
+                            _icpWorkflowTaskQueueProvider);
+
+                    isolated function _icpWorkflowTaskQueueProvider() returns string? {
+                        return _icpWorkflowMgmt:getWorkflowTaskQueue();
+                    }
+
+                    isolated function _icpWorkflowMetadataProvider() returns map<json>|error {
+                        json raw = (check _icpWorkflowMgmt:getWorkflowMetadata()).toJson();
+                        if raw is map<json> {
+                            return raw;
+                        }
+                        return error("Unexpected workflow metadata shape");
+                    }
+
+                    isolated function _icpWorkflowCommandExecutor(map<json> command) returns map<json>|error {
+                        _icpWorkflowMgmt:Command|error managementCommand = command.cloneWithType();
+                        if managementCommand is error {
+                            // An operation this workflow version does not know, or parameters
+                            // that do not fit the command shape.
+                            return {
+                                httpStatus: 400,
+                                body: {"error": {"message": managementCommand.message()}}
+                            };
+                        }
+                        json|_icpWorkflowMgmt:Error result = _icpWorkflowMgmt:executeCommand(managementCommand);
+                        if result is _icpWorkflowMgmt:Error {
+                            return {
+                                httpStatus: _icpWorkflowStatusCode(_icpWorkflowMgmt:errorCodeOf(result)),
+                                body: _icpWorkflowMgmt:toErrorJson(result)
+                            };
+                        }
+                        // Starting an instance creates one; every other operation reads or
+                        // mutates an existing one.
+                        int status = managementCommand.operation == _icpWorkflowMgmt:START_INSTANCE ? 201 : 200;
+                        return {httpStatus: status, body: result};
+                    }
+
+                    // The tunnel's result envelope carries `httpStatus` as protocol data — the
+                    // code the management REST API would answer with, which the ICP replays to
+                    // the console verbatim. The workflow module reports only the protocol-
+                    // independent reason (`errorCodeOf`); choosing the number for each reason
+                    // is this envelope's own wire contract, owned here. A reason this glue
+                    // does not know (added after this bridge version) reports 500, and the
+                    // body still carries the runtime's message.
+                    isolated function _icpWorkflowStatusCode(_icpWorkflowMgmt:ErrorCode code) returns int {
+                        match code {
+                            _icpWorkflowMgmt:NOT_FOUND => {
+                                return 404;
+                            }
+                            _icpWorkflowMgmt:ACCESS_DENIED => {
+                                return 403;
+                            }
+                            _icpWorkflowMgmt:INVALID_REQUEST => {
+                                return 400;
+                            }
+                            _icpWorkflowMgmt:CONFLICT => {
+                                return 409;
+                            }
+                            _icpWorkflowMgmt:INVALID_PAYLOAD => {
+                                return 422;
+                            }
+                        }
+                        return 500;
+                    }
+                    """;
+        }
+    }
+}

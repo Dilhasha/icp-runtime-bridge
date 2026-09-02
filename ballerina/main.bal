@@ -15,6 +15,7 @@
 import ballerina/lang.runtime;
 import ballerina/log;
 import ballerina/task;
+import ballerina/time;
 
 function init() returns error? {
     log:printInfo("Starting ICP agent...");
@@ -86,6 +87,30 @@ function startICPAgent(IcpClient icpClient, IcpConfig config, string[] supported
     }
 }
 
+// Guards against overlapping heartbeat ticks. The scheduler fires `execute()` at a
+// fixed frequency regardless of whether the previous tick has finished, and a tick can
+// now legitimately run close to one full interval (boost follow-ups) — or past it, when
+// a tunneled command is slow. HeartbeatJob's bookkeeping fields (`heartbeat`,
+// `fullHeartbeatRequired`, `supportedHeartbeatFields`) are unsynchronized, so two ticks
+// must never run concurrently; a tick that finds the flag held simply skips.
+isolated boolean heartbeatTickInProgress = false;
+
+isolated function tryBeginHeartbeatTick() returns boolean {
+    lock {
+        if heartbeatTickInProgress {
+            return false;
+        }
+        heartbeatTickInProgress = true;
+        return true;
+    }
+}
+
+isolated function endHeartbeatTick() {
+    lock {
+        heartbeatTickInProgress = false;
+    }
+}
+
 // Heartbeat job
 public class HeartbeatJob {
     *task:Job;
@@ -114,15 +139,62 @@ public class HeartbeatJob {
         }
     }
 
-    # Executes the heartbeat job.
+    # Executes the heartbeat job: one heartbeat round, plus bounded follow-up rounds
+    # while the server is actively tunneling work. A follow-up happens immediately
+    # after executing a tunneled command (its result may already have unblocked the
+    # next queued command) or after the server's `nextHeartbeatInSeconds` boost hint
+    # (sent while a user is actively working with workflow views). Follow-ups stop
+    # once the tick's real elapsed time — rounds and sleeps alike — would exceed one
+    # regular interval, so a tick never runs much past the next scheduled one, which
+    # then continues the boost. A tick that IS still running when the scheduler fires
+    # again (a slow command, a slow server) makes the new tick a no-op instead of a
+    # second concurrent round: the job's heartbeat bookkeeping fields are not
+    # synchronized, and overlapping rounds would race on them.
     public function execute() {
+        if !tryBeginHeartbeatTick() {
+            log:printWarn("Skipping this heartbeat tick — the previous one is still running");
+            return;
+        }
+        decimal tickStart = time:monotonicNow();
+        while true {
+            decimal? followUpDelay = self.heartbeatRound();
+            if followUpDelay is () {
+                break;
+            }
+            decimal remainingBudget = self.interval - (time:monotonicNow() - tickStart);
+            if followUpDelay >= remainingBudget {
+                break;
+            }
+            if followUpDelay > 0d {
+                runtime:sleep(followUpDelay);
+            }
+        }
+        endHeartbeatTick();
+    }
 
+    # Sends one heartbeat (full or delta), processes the response, and decides whether
+    # a follow-up round is wanted.
+    #
+    # + return - Seconds to wait before the follow-up round (0 = immediately), or `()`
+    #            when no follow-up is needed this tick
+    function heartbeatRound() returns decimal? {
         HeartbeatResponse|error heartbeatResponse;
+        // The workflow worker registers its task queue on its own schedule, often after the
+        // first full heartbeat has gone out — and delta heartbeats carry no fields. Left to
+        // itself, the queue would wait for an unrelated full-heartbeat trigger while the ICP
+        // scoped that runtime's reads namespace-wide. A change in the live value against the
+        // last published one promotes this round to a full heartbeat.
+        if !self.fullHeartbeatRequired {
+            Heartbeat? lastPublished = self.heartbeat;
+            if lastPublished is Heartbeat && currentWorkflowTaskQueue() != lastPublished?.workflowTaskQueue {
+                self.fullHeartbeatRequired = true;
+            }
+        }
         if (self.fullHeartbeatRequired) {
             Heartbeat|error newHeartbeat = getHeartbeat(self.supportedHeartbeatFields);
             if newHeartbeat is error {
                 log:printError("Failed to create full heartbeat", newHeartbeat);
-                return;
+                return ();
             }
             self.heartbeat = newHeartbeat;
             log:printInfo("Sending full heartbeat to ICP server");
@@ -138,17 +210,17 @@ public class HeartbeatJob {
             DeltaHeartbeat|error deltaHeartbeat = getDeltaHeartbeat(lastHeartbeat);
             if deltaHeartbeat is error {
                 log:printError("Failed to create delta heartbeat", deltaHeartbeat);
-                return;
+                return ();
             }
             log:printDebug("Sending delta heartbeat to ICP server");
             heartbeatResponse = self.icpClient->sendDeltaHeartbeat(deltaHeartbeat);
         }
         if heartbeatResponse is error {
             log:printError("Heartbeat response error", heartbeatResponse);
-            return;
+            return ();
         }
         if !heartbeatResponse.acknowledged {
-            return;
+            return ();
         }
         self.fullHeartbeatRequired = heartbeatResponse.fullHeartbeatRequired ?: false;
         string[] newSupportedHeartbeatFields = heartbeatResponse.supportedHeartbeatFields ?: [];
@@ -161,15 +233,34 @@ public class HeartbeatJob {
         }
         self.supportedHeartbeatFields = newSupportedHeartbeatFields;
         log:printDebug("Heartbeat acknowledged by ICP server");
-        self.handleControlCommands(heartbeatResponse.commands);
+        boolean processedTunneledCommand = self.handleControlCommands(heartbeatResponse.commands);
+        if processedTunneledCommand {
+            // Fetch the next queued command right away — the posted result has likely
+            // unblocked the ICP-side caller already.
+            return 0;
+        }
+        int? boostHint = heartbeatResponse.nextHeartbeatInSeconds;
+        if boostHint is int && boostHint > 0 && <decimal>boostHint < self.interval {
+            return <decimal>boostHint;
+        }
+        return ();
     }
 
-    function handleControlCommands(ControlCommand[] commands) {
+    # Handles the control commands delivered in a heartbeat response.
+    #
+    # + commands - The commands from the response
+    # + return - `true` when at least one tunneled command was processed, so the
+    #            caller can immediately fetch the next queued command
+    function handleControlCommands(ControlCommand[] commands) returns boolean {
         if commands.length() == 0 {
-            return;
+            return false;
         }
 
         boolean artifactsChanged = false;
+        boolean tunneledCommandProcessed = false;
+        // Tunneled commands are collected here and executed concurrently once the artifact
+        // commands - which mutate this runtime's own state and must stay ordered - are done.
+        [ControlCommand, TunneledCommandExecutor?, boolean][] tunneledCommands = [];
         foreach ControlCommand command in commands {
             log:printInfo(string `Handling control command: ${command.toJsonString()}`);
             command.status = PENDING;
@@ -221,6 +312,25 @@ public class HeartbeatJob {
                         }
                     }
                 }
+                _ => {
+                    // Tunneled command kinds all route through here; their actions are
+                    // bound to executors in ONE place (tunneledCommandBinding), so adding
+                    // a kind cannot silently miss this dispatch. An action with no
+                    // binding is a wiring bug — report it FAILED rather than letting it
+                    // fall through as a silent COMPLETED no-op.
+                    var binding = tunneledCommandBinding(command.action);
+                    if binding is () {
+                        result = error(string `No handler is wired for control action ${command.action}`);
+                    } else {
+                        tunneledCommandProcessed = true;
+                        // Executed off this strand: a batch carries the queued work of several
+                        // people, and running it in sequence here made every one of them wait
+                        // for the slowest (a large history is seconds of work) while the next
+                        // heartbeat - and so every other command - waited for the whole batch.
+                        // Each command reports its own outcome, so nothing is joined.
+                        tunneledCommands.push([command, binding[0], binding[1]]);
+                    }
+                }
             }
 
             // Update command status based on result
@@ -232,13 +342,107 @@ public class HeartbeatJob {
             }
         }
 
+        // Fan the tunneled commands out with a bounded number in flight, so a large batch
+        // degrades into slightly later answers rather than into a saturated worker pool or a
+        // rate-limited Temporal client.
+        if tunneledCommands.length() > 0 {
+            self.executeTunneledCommands(tunneledCommands);
+        }
+
         if artifactsChanged {
             Heartbeat|error newHeartbeat = getHeartbeat(self.supportedHeartbeatFields);
             if newHeartbeat is error {
                 log:printError("Failed to create full heartbeat after control command", newHeartbeat);
-                return;
+                return tunneledCommandProcessed;
             }
             self.heartbeat = newHeartbeat;
         }
+        return tunneledCommandProcessed;
     }
+
+    # Executes a batch of tunneled commands with a bounded number in flight.
+    #
+    # A batch carries the queued work of several people. Running it in sequence made each of
+    # them wait for the slowest - a large history is seconds of work - and held up the next
+    # heartbeat, and so every command after it, for the length of the whole batch.
+    #
+    # The batch is still waited for before returning, deliberately: the bridge asks the ICP
+    # for more work only once it has finished, and that pull is the back-pressure that keeps
+    # a backlog from arriving faster than it can be executed.
+    #
+    # + commands - The tunneled commands, each with its executor and acceptance flag
+    function executeTunneledCommands([ControlCommand, TunneledCommandExecutor?, boolean][] commands) {
+        // A misconfigured concurrency of 0 or less would keep chunkEnd at index and spin this
+        // loop forever, wedging every later heartbeat behind the in-progress guard.
+        int concurrency = int:max(1, tunneledCommandConcurrency);
+        int index = 0;
+        while index < commands.length() {
+            int chunkEnd = index + concurrency;
+            if chunkEnd > commands.length() {
+                chunkEnd = commands.length();
+            }
+            future<error?>[] running = [];
+            ControlCommand[] inChunk = [];
+            foreach int i in index ..< chunkEnd {
+                [ControlCommand, TunneledCommandExecutor?, boolean] item = commands[i];
+                inChunk.push(item[0]);
+                future<error?> pending = start self.handleTunneledCommand(item[0], item[1], item[2]);
+                running.push(pending);
+            }
+            foreach int i in 0 ..< running.length() {
+                error? outcome = wait running[i];
+                if outcome is error {
+                    log:printError(string `Command failed: ${inChunk[i].commandId}`, outcome);
+                    inChunk[i].status = FAILED;
+                } else {
+                    inChunk[i].status = COMPLETED;
+                }
+            }
+            index = chunkEnd;
+        }
+    }
+
+    # Executes one tunneled command and posts its result to the ICP. A command past
+    # its deadline — or carrying one that cannot be parsed — is dropped unexecuted
+    # (see `validateCommandDeadline`); the drop is reported as an error so the
+    # command's local status honestly reads FAILED, not COMPLETED.
+    #
+    # + command - The tunneled control command
+    # + executor - The executor bound to this command's action (see
+    #              `tunneledCommandBinding`), or `()` when none is registered
+    # + accepted - Whether this runtime currently accepts this command kind
+    # + return - An error when the payload is unusable, the deadline had passed or
+    #            was malformed, or the result could not be delivered (the command's
+    #            status is reported FAILED then)
+    function handleTunneledCommand(ControlCommand command, TunneledCommandExecutor? executor,
+            boolean accepted) returns error? {
+        string rawPayload = command.payload ?: "";
+        if rawPayload == "" {
+            return error(string `Missing payload for ${command.action} command`);
+        }
+        TunneledCommandPayload payload = check rawPayload.fromJsonStringWithType();
+        check validateCommandDeadline(payload?.deadline, payload.commandId);
+
+        TunneledCommandResult? result = executeTunneledCommand(payload, executor, accepted);
+        if result is TunneledCommandResult {
+            check self.icpClient->sendCommandResult(result);
+        }
+    }
+}
+
+# The single place a `ControlAction` is recognized as a tunneled command kind and bound
+# to its executor and acceptance flag. Adding a new tunneled kind means adding an arm
+# here — the dispatch in `handleControlCommands` and the execution plumbing in
+# `command_tunnel.bal` pick it up from this binding alone.
+#
+# + action - The control command's action
+# + return - The executor (or `()` when none registered) and the opt-in flag for this
+#            kind, or `()` when the action is not a tunneled command kind
+function tunneledCommandBinding(ControlAction action) returns [TunneledCommandExecutor?, boolean]? {
+    match action {
+        WORKFLOW_MGMT => {
+            return [workflowExecutor(), enableWorkflowManagement];
+        }
+    }
+    return ();
 }
